@@ -1,0 +1,154 @@
+# JellyRent - full stack: 3 Jellyfin nodes, central PostgreSQL, API, worker, web.
+#
+#   cp .env.example .env   (or: make env)
+#   make media             (generate the test films)
+#   docker compose up -d --build
+#
+# Web UI http://localhost:8080 - API docs http://localhost:8000/api/docs
+# Jellyfin nodes http://localhost:8096 / 8097 / 8098
+
+name: jellyrent
+
+x-jellyfin: &jellyfin
+  # Pinned: the SQLite schema read through sqlite_fdw is version-specific.
+  image: jellyfin/jellyfin:12.4.20261026-211555
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8096/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 30
+    start_period: 30s
+
+x-app: &app
+  build: ./api
+  image: jellyrent-api:local
+  restart: unless-stopped
+  depends_on:
+    central-db:
+      condition: service_healthy
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://jellyrent_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@central-db:5432/jellyrent
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_JSON: "true"
+  CATALOG_SOURCE: ${CATALOG_SOURCE:-auto}
+  JELLYFIN_ADMIN_USERNAME: ${JELLYFIN_ADMIN_USERNAME:-jellyrent-admin}
+
+services:
+  # ------------------------------------------------------------------ nodes
+  jellyfin-1:
+    <<: *jellyfin
+    container_name: jellyfin-1
+    environment:
+      JELLYFIN_PublishedServerUrl: http://localhost:8096
+    ports: ["8096:8096"]
+    volumes:
+      - jf1-config:/config
+      - jf1-cache:/cache
+      - ./media/jf1:/media:ro
+
+  jellyfin-2:
+    <<: *jellyfin
+    container_name: jellyfin-2
+    environment:
+      JELLYFIN_PublishedServerUrl: http://localhost:8097
+    ports: ["8097:8096"]
+    volumes:
+      - jf2-config:/config
+      - jf2-cache:/cache
+      - ./media/jf2:/media:ro
+
+  jellyfin-3:
+    <<: *jellyfin
+    container_name: jellyfin-3
+    environment:
+      JELLYFIN_PublishedServerUrl: http://localhost:8098
+    ports: ["8098:8096"]
+    volumes:
+      - jf3-config:/config
+      - jf3-cache:/cache
+      - ./media/jf3:/media:ro
+
+  # ---------------------------------------------------------- central database
+  central-db:
+    build: ./db
+    image: jellyrent-db:local
+    container_name: jellyrent-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jellyrent
+      POSTGRES_USER: jellyrent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # The nodes' SQLite databases, read-only (NF3): /jf/jfN/data/jellyfin.db
+      - jf1-config:/jf/jf1:ro
+      - jf2-config:/jf/jf2:ro
+      - jf3-config:/jf/jf3:ro
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      # TCP check: during initialisation the server listens on the socket only.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "jellyrent", "-d", "jellyrent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ------------------------------------------------------------ application
+  bootstrap:
+    <<: *app
+    restart: "no"
+    command: ["python", "-m", "app.bootstrap"]
+    environment:
+      <<: *app-env
+      JELLYFIN_ADMIN_PASSWORD: ${JELLYFIN_ADMIN_PASSWORD:?set JELLYFIN_ADMIN_PASSWORD in .env}
+    depends_on:
+      central-db: { condition: service_healthy }
+      jellyfin-1: { condition: service_healthy }
+      jellyfin-2: { condition: service_healthy }
+      jellyfin-3: { condition: service_healthy }
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      RENTAL_DEFAULT_HOURS: ${RENTAL_DEFAULT_HOURS:-48}
+    ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  watchdog:
+    <<: *app
+    command: ["python", "-m", "app.watchdog"]
+    environment:
+      <<: *app-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, sys, time; sys.exit(time.time() - os.path.getmtime('/tmp/jellyrent-worker.alive') > 60)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+
+  web:
+    build: ./web
+    image: jellyrent-web:local
+    restart: unless-stopped
+    ports: ["8080:80"]
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  jf1-config:
+  jf1-cache:
+  jf2-config:
+  jf2-cache:
+  jf3-config:
+  jf3-cache:

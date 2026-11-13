@@ -1,0 +1,25 @@
+# Throwaway central database for integration tests (`make test-integration`).
+# Data lives on tmpfs; the FDW tests mount generated SQLite files at /jf/test.
+
+name: jellyrent-test
+
+services:
+  central-db:
+    build: ./db
+    image: jellyrent-db:local
+    environment:
+      POSTGRES_DB: jellyrent
+      POSTGRES_USER: jellyrent
+      POSTGRES_PASSWORD: test
+      APP_DB_PASSWORD: test
+    command: ["postgres", "-c", "max_connections=200", "-c", "fsync=off"]
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./api/tests/.fixtures:/jf/test:ro
+    ports: ["127.0.0.1:55432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "jellyrent", "-d", "jellyrent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
